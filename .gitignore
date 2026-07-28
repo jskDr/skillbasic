@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target/
+debug
+*.rs.bk
+
+# Cargo lockfile (keep for binaries, ignore for libraries — this is a binary)
+# Cargo.lock
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env/settings.json
+.env.local
+*.local
