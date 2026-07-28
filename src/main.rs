@@ -186,7 +186,7 @@ fn exec_immediate(
             Stmt::Save(path) => {
                 flush!();
                 let mut text = String::new();
-                for (_, src) in prog_src.iter() {
+                for src in prog_src.values() {
                     text.push_str(src);
                     text.push('\n');
                 }
