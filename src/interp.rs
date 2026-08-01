@@ -343,6 +343,10 @@ impl Interp {
                     Value::Str(s) => s,
                     other => other.as_str()?,
                 };
+                if std::env::var_os("SKILLBASIC_TRACE_PROMPTS").is_some() {
+                    let payload = serde_json::json!({ "type": "skillbasic_prompt", "prompt": q });
+                    eprintln!("SKILLBASIC_PROMPT {}", payload);
+                }
                 let reply =
                     crate::ai::complete(&self.ai_cfg, Some(&self.ai_cfg.system), &self.chat, &q)?;
                 self.chat.push(crate::ai::ChatMessage::user(q));
