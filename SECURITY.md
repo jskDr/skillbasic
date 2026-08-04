@@ -20,4 +20,8 @@ Skill BASIC is a local interpreter and does not sandbox programs. `LOAD` and
 `SAVE` use the invoking user's filesystem permissions. `PROMPT` sends the
 current prompt and bounded recent conversation history to the configured AI
 backend. Version 0.1 uses Ollama; cloud models and remote hosts may process that
-data off-device. Future backends must document their own data-handling behavior.
+data off-device. The pi RPC backend disables pi tools and extensions by default.
+If `pi.tools` is explicitly enabled in `.env/settings.json`, pi may execute
+tools and extensions with the invoking user's filesystem and process
+permissions. The model provider configured in pi may process prompt data
+off-device.

@@ -1,10 +1,11 @@
 // Tree-walking interpreter.
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use crate::ast::*;
 use crate::builtins;
+use crate::line_input::{LineInput, ReadOutcome};
 use crate::value::{Value, format_basic_number};
 
 /// Text printed by the `HELP` command: a concise listing of the AI and
@@ -19,11 +20,11 @@ const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 const MAX_CHAT_MESSAGES: usize = 40;
 const MAX_CHAT_BYTES: usize = 256 * 1024;
 
-/// Streams passed by the caller; threaded through execution so the caller
-/// keeps ownership of stdin/stdout (needed for the REPL).
+/// Output and line input passed by the caller; threaded through execution so
+/// the REPL and BASIC INPUT share the same Unicode-aware editor.
 pub struct Io<'a> {
     pub out: &'a mut dyn Write,
-    pub input: &'a mut dyn BufRead,
+    pub input: &'a mut dyn LineInput,
 }
 
 /// Control-flow result of executing one statement.
@@ -64,6 +65,8 @@ pub struct Interp {
     // and can answer follow-up questions with full context. Reset on `RUN`
     // (with variables).
     chat: Vec<crate::ai::ChatMessage>,
+    pi_rpc: Option<crate::pi_rpc::PiRpcClient>,
+    pi_session_reset_pending: bool,
 }
 
 impl Interp {
@@ -82,6 +85,8 @@ impl Interp {
             col: 0,
             ai_cfg: crate::ai::AiConfig::default(),
             chat: Vec::new(),
+            pi_rpc: None,
+            pi_session_reset_pending: false,
         }
     }
 
@@ -90,6 +95,10 @@ impl Interp {
     /// startup after reading the settings file and applying env overlays.
     pub fn set_ai_config(&mut self, cfg: crate::ai::AiConfig) {
         self.ai_cfg = cfg;
+    }
+
+    pub fn set_pi_rpc(&mut self, client: crate::pi_rpc::PiRpcClient) {
+        self.pi_rpc = Some(client);
     }
 
     /// Load a program (line -> statements) into the flattened code vector
@@ -151,7 +160,14 @@ impl Interp {
         // Also start a fresh conversation: a new RUN is a new chat session,
         // so a summary prompt like "how many tests passed?" doesn't leak
         // context from a previous run.
+        self.reset_ai_context();
+    }
+
+    pub fn reset_ai_context(&mut self) {
         self.chat.clear();
+        if self.pi_rpc.is_some() {
+            self.pi_session_reset_pending = true;
+        }
     }
 
     /// Run the loaded program from the beginning.
@@ -347,14 +363,35 @@ impl Interp {
                     let payload = serde_json::json!({ "type": "skillbasic_prompt", "prompt": q });
                     eprintln!("SKILLBASIC_PROMPT {}", payload);
                 }
-                let reply =
-                    crate::ai::complete(&self.ai_cfg, Some(&self.ai_cfg.system), &self.chat, &q)?;
+                let reply = match self.ai_cfg.engine {
+                    crate::ai::Engine::PiRpc => {
+                        let client = self
+                            .pi_rpc
+                            .as_mut()
+                            .ok_or("?AI ERROR: pi-rpc engine not initialized")?;
+                        if self.pi_session_reset_pending {
+                            client.new_session()?;
+                            self.pi_session_reset_pending = false;
+                        }
+                        let reply = client.prompt_stream(&q, |text| stream_text(io.out, text))?;
+                        self.newline(io);
+                        reply
+                    }
+                    crate::ai::Engine::Ollama => crate::ai::complete(
+                        &self.ai_cfg,
+                        Some(&self.ai_cfg.system),
+                        &self.chat,
+                        &q,
+                    )?,
+                };
                 self.chat.push(crate::ai::ChatMessage::user(q));
                 self.chat
                     .push(crate::ai::ChatMessage::assistant(reply.clone()));
                 self.trim_chat();
-                self.emit(io, &reply);
-                self.newline(io);
+                if self.ai_cfg.engine == crate::ai::Engine::Ollama {
+                    self.emit(io, &reply);
+                    self.newline(io);
+                }
                 Ok(Ctrl::Next)
             }
             // HELP: print a concise command listing. Works in both program
@@ -498,24 +535,15 @@ impl Interp {
     }
 
     fn exec_input(&mut self, prompt: &str, vars: &[String], io: &mut Io) -> Result<(), String> {
-        if !prompt.is_empty() {
-            self.emit(io, prompt);
-        } else {
-            self.emit(io, "? ");
-        }
-        let _ = io.out.flush();
-        let mut line = String::new();
-        if io
-            .input
-            .read_line(&mut line)
-            .map_err(|e| format!("?I/O ERROR: {}", e))?
-            == 0
-        {
-            return Err("?INPUT ERROR: end of input".into());
-        }
-        let line = line.trim_end_matches(['\n', '\r']);
+        let display_prompt = if !prompt.is_empty() { prompt } else { "? " };
+        let line = match io.input.read_line(display_prompt, io.out)? {
+            ReadOutcome::Line(line) => line,
+            ReadOutcome::Eof => return Err("?INPUT ERROR: end of input".into()),
+            ReadOutcome::Interrupted => return Err("?INPUT INTERRUPTED".into()),
+        };
+        self.col = 0;
         let fields: Vec<String> = if vars.len() == 1 {
-            vec![line.to_string()]
+            vec![line]
         } else {
             line.split(',').map(|s| s.trim().to_string()).collect()
         };
@@ -821,6 +849,16 @@ impl Interp {
     }
 }
 
+fn stream_text(out: &mut dyn Write, text: &str) -> Result<(), String> {
+    let mut bytes = [0; 4];
+    for ch in text.chars() {
+        out.write_all(ch.encode_utf8(&mut bytes).as_bytes())
+            .and_then(|_| out.flush())
+            .map_err(|e| format!("?I/O ERROR: {}", e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,7 +882,8 @@ mod tests {
         let mut interp = Interp::new();
         interp.load(&prog);
         let mut out: Vec<u8> = Vec::new();
-        let mut input = Cursor::new(input.as_bytes());
+        let cursor = Cursor::new(input.as_bytes());
+        let mut input = crate::line_input::BufferedLineInput::new(cursor);
         let mut io = Io {
             out: &mut out,
             input: &mut input,
@@ -949,6 +988,18 @@ mod tests {
     }
 
     #[test]
+    fn unicode_string_literal_is_preserved() {
+        assert_eq!(run_imm("10 PRINT \"안녕하세요\""), "안녕하세요\n");
+    }
+
+    #[test]
+    fn streamed_text_writes_complete_unicode_characters() {
+        let mut out = Vec::new();
+        stream_text(&mut out, "한글A").unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "한글A");
+    }
+
+    #[test]
     fn string_concat_and_funcs() {
         let out = run_imm(
             "10 A$=\"AB\"\n20 B$=\"CD\"\n30 PRINT A$+B$\n40 PRINT LEN(A$+B$)\n\
@@ -990,7 +1041,8 @@ mod tests {
             let mut interp = Interp::new();
             interp.load(&prog);
             let mut out: Vec<u8> = Vec::new();
-            let mut input = Cursor::new(&b""[..]);
+            let cursor = Cursor::new(&b""[..]);
+            let mut input = crate::line_input::BufferedLineInput::new(cursor);
             let mut io = Io {
                 out: &mut out,
                 input: &mut input,
@@ -1007,7 +1059,8 @@ mod tests {
         let mut interp = Interp::new();
         interp.load(&[(10, stmts)]);
         let mut out = Vec::new();
-        let mut input = Cursor::new(&b""[..]);
+        let cursor = Cursor::new(&b""[..]);
+        let mut input = crate::line_input::BufferedLineInput::new(cursor);
         let mut io = Io {
             out: &mut out,
             input: &mut input,
@@ -1056,13 +1109,16 @@ mod tests {
             // without depending on whether a real Ollama is running on the
             // test machine.
             interp.set_ai_config(crate::ai::AiConfig {
+                engine: crate::ai::Engine::Ollama,
                 host: "http://127.0.0.1:1".to_string(),
                 model: "__test__".to_string(),
                 system: String::new(),
+                pi: crate::ai::PiConfig::default(),
             });
             interp.load(&prog);
             let mut out: Vec<u8> = Vec::new();
-            let mut input = Cursor::new(&b""[..]);
+            let cursor = Cursor::new(&b""[..]);
+            let mut input = crate::line_input::BufferedLineInput::new(cursor);
             let mut io = Io {
                 out: &mut out,
                 input: &mut input,

@@ -234,9 +234,8 @@ impl<'a> Lexer<'a> {
     fn string(&mut self) -> Result<String, LexError> {
         let start = self.pos;
         self.advance(); // opening quote
-        let mut s = String::new();
+        let content_start = self.pos;
         while !self.eof() && self.peek() != b'"' {
-            s.push(self.peek() as char);
             self.advance();
         }
         if self.eof() {
@@ -245,6 +244,9 @@ impl<'a> Lexer<'a> {
                 pos: start,
             });
         }
+        let s = std::str::from_utf8(&self.src[content_start..self.pos])
+            .expect("lexer input is valid UTF-8")
+            .to_string();
         self.advance(); // closing quote
         Ok(s)
     }

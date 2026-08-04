@@ -58,7 +58,7 @@ development, and language behavior or command syntax may change before version
 ## Requirements
 
 - Rust 1.90 or later
-- Ollama when using `PROMPT` in version 0.1
+- Ollama, or the `pi` CLI when using the `pi-rpc` backend
 
 ## Quick start
 
@@ -89,7 +89,11 @@ conversation in three executable lines.
 Recent user and assistant messages are retained for follow-up prompts. History
 is reset at the start of each `RUN` and is bounded to limit memory use.
 
-### Current v0.1 backend: Ollama
+Interactive REPL and BASIC `INPUT` lines use Unicode-aware editing, including
+multibyte-safe Backspace/Delete, cursor movement, and in-memory history. Piped
+input is read lossily so a malformed UTF-8 byte does not terminate a program.
+
+### Ollama
 
 Ollama is the reference backend in version 0.1. It makes the initial
 implementation easy to run with local models and also supports remote or cloud
@@ -100,6 +104,37 @@ Local Ollama models can process prompts without sending them to a model
 provider. Cloud models and remote Ollama hosts send prompt and recent
 conversation data to another system. Do not include credentials, private data,
 or other secrets in prompts.
+
+### pi RPC
+
+Run Skill BASIC with `--engine pi-rpc` to use an installed `pi` CLI:
+
+```console
+cargo run -- --engine pi-rpc samples/aichatbot.bas
+```
+
+Skill BASIC starts `pi --mode rpc --no-session`. Tools and extensions are
+disabled by default, so a prompt cannot run shell commands or modify files.
+Optional pi settings can be added alongside the existing Ollama settings in
+`.env/settings.json`:
+
+```json
+{
+  "host": "http://localhost:11434",
+  "model": "llama3.2",
+  "pi": {
+    "model": "provider/model",
+    "system": "You are a concise assistant.",
+    "tools": false
+  }
+}
+```
+
+If `pi.model` or `pi.system` is omitted, pi uses its own configured default.
+Setting `pi.tools` to `true` enables pi's normal tools and extensions with the
+invoking user's permissions. RPC operations time out after 120 seconds. `RUN`,
+`NEW`, and `CLEAR` reset the pi conversation before the next `PROMPT`. pi text
+is printed and flushed one Unicode character at a time as it is generated.
 
 ### Future providers
 

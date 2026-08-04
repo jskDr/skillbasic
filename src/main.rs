@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::exit;
 
 mod ai;
@@ -13,12 +13,16 @@ mod ast;
 mod builtins;
 mod interp;
 mod lexer;
+mod line_input;
 mod parser;
+mod pi_rpc;
 mod token;
 mod value;
 
+use ai::Engine;
 use ast::Stmt;
 use interp::{Interp, Io};
+use line_input::{BufferedLineInput, LineInput, ReadOutcome, TerminalLineInput};
 
 /// Project-level AI config file, looked up relative to the current working
 /// directory at startup. See `ai::AiConfig::from_file` for the JSON shape.
@@ -28,10 +32,45 @@ const MAX_PROGRAM_BYTES: u64 = 1024 * 1024;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 && (args[1] == "-h" || args[1] == "--help") {
-        eprintln!("usage: skillbasic [file.bas]   (no args -> interactive REPL)");
+        eprintln!(
+            "usage: skillbasic [--engine ollama|pi-rpc] [file.bas]   (no args -> interactive REPL)"
+        );
         eprintln!("       in the REPL, type HELP for AI/command help");
-        eprintln!("       AI config: {} (host, model, system)", SETTINGS_PATH);
+        eprintln!(
+            "       AI config: {} (Ollama fields and optional pi object)",
+            SETTINGS_PATH
+        );
         exit(0);
+    }
+
+    let mut engine = Engine::Ollama;
+    let mut file_arg: Option<&str> = None;
+    {
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--engine" {
+                if i + 1 < args.len() {
+                    engine = match args[i + 1].as_str() {
+                        "ollama" => Engine::Ollama,
+                        "pi-rpc" => Engine::PiRpc,
+                        other => {
+                            eprintln!(
+                                "?ERROR: unknown engine '{}' (expected ollama or pi-rpc)",
+                                other
+                            );
+                            exit(1);
+                        }
+                    };
+                    i += 2;
+                } else {
+                    eprintln!("?ERROR: --engine requires a value (ollama or pi-rpc)");
+                    exit(1);
+                }
+            } else {
+                file_arg = Some(&args[i]);
+                i += 1;
+            }
+        }
     }
 
     let mut prog_src: BTreeMap<u32, String> = BTreeMap::new();
@@ -41,27 +80,48 @@ fn main() {
     // Resolve AI config: settings file -> env-var overlays -> install on interp.
     // A malformed file is warned about but not fatal, so the REPL still works;
     // a missing file is silent (the common case when no config is wanted).
-    let cfg = match ai::AiConfig::from_file(std::path::Path::new(SETTINGS_PATH)) {
+    let mut cfg = match ai::AiConfig::from_file(std::path::Path::new(SETTINGS_PATH)) {
         Ok(cfg) => cfg.with_env_overlays(),
         Err(e) => {
             eprintln!("{} (continuing with default AI config)", e);
             ai::AiConfig::default().with_env_overlays()
         }
     };
+    cfg.engine = engine;
+    if engine == Engine::PiRpc {
+        match pi_rpc::PiRpcClient::spawn(&cfg.pi) {
+            Ok(client) => interp.set_pi_rpc(client),
+            Err(e) => {
+                eprintln!("{}", e);
+                exit(1);
+            }
+        }
+    }
     interp.set_ai_config(cfg);
 
     let stdin = io::stdin();
-    let mut stdin_lock = stdin.lock();
     let stdout = io::stdout();
+    let use_line_editor = stdin.is_terminal() && stdout.is_terminal();
     let mut stdout = stdout.lock();
+    let mut input: Box<dyn LineInput + '_> = if use_line_editor {
+        match TerminalLineInput::new() {
+            Ok(editor) => Box::new(editor),
+            Err(e) => {
+                eprintln!("{}", e);
+                exit(1);
+            }
+        }
+    } else {
+        Box::new(BufferedLineInput::new(stdin.lock()))
+    };
 
     // If a file was given, load it and run immediately.
-    if args.len() > 1 {
-        match load_file(&args[1], &mut prog, &mut prog_src) {
+    if let Some(path) = file_arg {
+        match load_file(path, &mut prog, &mut prog_src) {
             Ok(()) => {
                 let mut io = Io {
                     out: &mut stdout,
-                    input: &mut stdin_lock,
+                    input: input.as_mut(),
                 };
                 run_program(&mut interp, &prog, &mut io);
             }
@@ -74,29 +134,29 @@ fn main() {
     }
 
     // Interactive REPL.
-    let is_tty = io::stdout().is_terminal();
-    if is_tty {
+    if use_line_editor {
         boot_screen(&mut stdout);
     }
     loop {
-        write!(stdout, "> ").ok();
-        stdout.flush().ok();
-        let mut line = String::new();
-        match stdin_lock.read_line(&mut line) {
-            Ok(0) => {
+        let line = match input.read_line("> ", &mut stdout) {
+            Ok(ReadOutcome::Line(line)) => line,
+            Ok(ReadOutcome::Eof) => {
                 writeln!(stdout).ok();
                 break;
             }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        let trimmed = line.trim_end();
+            Ok(ReadOutcome::Interrupted) => continue,
+            Err(e) => {
+                eprintln!("{}", e);
+                break;
+            }
+        };
+        let trimmed = line.as_str();
         if trimmed.is_empty() {
             continue;
         }
         let mut io = Io {
             out: &mut stdout,
-            input: &mut stdin_lock,
+            input: input.as_mut(),
         };
         match parser::parse(trimmed) {
             Ok((Some(lineno), stmts)) => {
@@ -175,6 +235,7 @@ fn exec_immediate(
                 prog.clear();
                 prog_src.clear();
                 interp.load(&[]);
+                interp.reset_ai_context();
             }
             Stmt::Load(path) => {
                 flush!();

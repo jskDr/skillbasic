@@ -35,6 +35,19 @@ const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_SYSTEM: &str = "You are a helpful assistant responding to a \
 Skill BASIC program. Keep replies concise and direct.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Ollama,
+    PiRpc,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PiConfig {
+    pub model: Option<String>,
+    pub system: Option<String>,
+    pub tools: bool,
+}
+
 /// Resolved AI configuration: where to reach Ollama and which model to ask for.
 ///
 /// `main` builds one of these at startup (env vars + settings file + defaults)
@@ -42,17 +55,21 @@ Skill BASIC program. Keep replies concise and direct.";
 /// settings without re-reading the environment or the file each time.
 #[derive(Debug, Clone)]
 pub struct AiConfig {
+    pub engine: Engine,
     pub host: String,
     pub model: String,
     pub system: String,
+    pub pi: PiConfig,
 }
 
 impl Default for AiConfig {
     fn default() -> Self {
         AiConfig {
+            engine: Engine::Ollama,
             host: DEFAULT_HOST.to_string(),
             model: DEFAULT_MODEL.to_string(),
             system: DEFAULT_SYSTEM.to_string(),
+            pi: PiConfig::default(),
         }
     }
 }
@@ -65,6 +82,14 @@ struct ConfigFile {
     host: Option<String>,
     model: Option<String>,
     system: Option<String>,
+    pi: Option<PiConfigFile>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct PiConfigFile {
+    model: Option<String>,
+    system: Option<String>,
+    tools: Option<bool>,
 }
 
 impl AiConfig {
@@ -110,6 +135,11 @@ impl AiConfig {
         }
         if let Some(s) = file.system {
             cfg.system = s;
+        }
+        if let Some(pi) = file.pi {
+            cfg.pi.model = pi.model;
+            cfg.pi.system = pi.system;
+            cfg.pi.tools = pi.tools.unwrap_or(false);
         }
         Ok(cfg)
     }
@@ -362,6 +392,27 @@ mod tests {
         // Other fields fall through to defaults.
         assert_eq!(cfg.host, DEFAULT_HOST);
         assert_eq!(cfg.model, DEFAULT_MODEL);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn config_file_sets_pi_options() {
+        let tmp = std::env::temp_dir().join("skillbasic_ai_settings_pi.json");
+        std::fs::write(
+            &tmp,
+            r#"{
+                "pi": {
+                    "model": "provider/model",
+                    "system": "Be concise",
+                    "tools": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let cfg = AiConfig::from_file(&tmp).unwrap();
+        assert_eq!(cfg.pi.model.as_deref(), Some("provider/model"));
+        assert_eq!(cfg.pi.system.as_deref(), Some("Be concise"));
+        assert!(cfg.pi.tools);
         let _ = std::fs::remove_file(&tmp);
     }
 
