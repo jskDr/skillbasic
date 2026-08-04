@@ -1,7 +1,8 @@
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFile, stat } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve } from "node:path";
+import type { Dirent } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 /**
  * A small TypeScript Skill BASIC interpreter for pi.
@@ -27,6 +28,15 @@ type Statement =
 
 type ProgramStmt = { line: number; stmt: Statement; source: string };
 
+type ResumeState = {
+	pc: number;
+	vars: [string, Value][];
+	inputPos: number;
+	stdout: string;
+	prompts: string[];
+	instructionCount: number;
+};
+
 type RunResult = {
 	stdout: string;
 	stderr: string;
@@ -35,6 +45,9 @@ type RunResult = {
 	instructionCount: number;
 	stopped: boolean;
 	timedOut: boolean;
+	needsInput: boolean;
+	inputPrompt: string;
+	resumeState: ResumeState | null;
 };
 
 function splitOutsideQuotes(text: string, separators: Set<string>): string[] {
@@ -257,20 +270,22 @@ function assign(text: string, vars: Vars): void {
 	vars.set(name, v);
 }
 
-function runSkillBasic(source: string, stdin = "", timeoutMs = 120_000, maxInstructions = 100_000): RunResult {
+function runSkillBasic(source: string, stdin = "", timeoutMs = 120_000, maxInstructions = 100_000, maxPrompts = Number.POSITIVE_INFINITY, resume: ResumeState | null = null): RunResult {
 	const program = parseProgram(source);
 	const firstIndexByLine = new Map<number, number>();
 	program.forEach((s, i) => { if (!firstIndexByLine.has(s.line)) firstIndexByLine.set(s.line, i); });
-	const vars: Vars = new Map();
+	const vars: Vars = new Map(resume?.vars ?? []);
 	const input = stdin.split(/\r?\n/);
-	let inputPos = 0;
-	let stdout = "";
+	let inputPos = 0;  // Always start at 0 for fresh stdin on resume
+	let stdout = resume?.stdout ?? "";
 	let stderr = "";
-	const prompts: string[] = [];
-	let pc = 0;
-	let instructionCount = 0;
+	const prompts: string[] = resume ? [...resume.prompts] : [];
+	let pc = resume?.pc ?? 0;
+	let instructionCount = resume?.instructionCount ?? 0;
 	let stopped = false;
 	let timedOut = false;
+	let needsInput = false;
+	let inputPrompt = "";
 	const deadline = Date.now() + timeoutMs;
 
 	const execInline = (thenText: string): number | null => {
@@ -289,15 +304,28 @@ function runSkillBasic(source: string, stdin = "", timeoutMs = 120_000, maxInstr
 			}
 			case "input": {
 				let rest = stmt.text;
+				let promptText = "";
 				const semicolon = rest.indexOf(";");
 				if (rest.trim().startsWith('"') && semicolon >= 0) {
-					const prompt = evalExpr(rest.slice(0, semicolon), vars);
-					stdout += String(prompt);
+					const promptVal = evalExpr(rest.slice(0, semicolon), vars);
+					promptText = String(promptVal);
 					rest = rest.slice(semicolon + 1).trim();
 				}
-				for (const nameRaw of rest.split(",").map((s) => s.trim()).filter(Boolean)) {
+				const varNames = rest.split(",").map((s) => s.trim()).filter(Boolean);
+				// Check if we have enough input lines for all variables
+				const needed = varNames.length;
+				const available = input.length - inputPos;
+				if (available < needed) {
+					// Don't add promptText to stdout when pausing — it will be added on resume
+					needsInput = true;
+					inputPrompt = promptText;
+					stopped = true;
+					return null;
+				}
+				stdout += promptText;
+				for (const nameRaw of varNames) {
 					const name = nameRaw.toUpperCase();
-					const line = inputPos < input.length ? input[inputPos++] : "";
+					const line = input[inputPos++];
 					vars.set(name, name.endsWith("$") ? line : Number(line));
 				}
 				return pc + 1;
@@ -309,6 +337,7 @@ function runSkillBasic(source: string, stdin = "", timeoutMs = 120_000, maxInstr
 				const prompt = format(evalExpr(stmt.expr, vars));
 				prompts.push(prompt);
 				stdout += `[PROMPT] ${prompt}\n`;
+				if (prompts.length >= maxPrompts) { stopped = true; return null; }
 				return pc + 1;
 			}
 			case "end": stopped = true; return null;
@@ -329,12 +358,71 @@ function runSkillBasic(source: string, stdin = "", timeoutMs = 120_000, maxInstr
 		stderr += "\n";
 	}
 
-	return { stdout, stderr, prompts, vars: Object.fromEntries(vars), instructionCount, stopped, timedOut };
+	const resumeState: ResumeState | null = needsInput
+		? { pc, vars: Array.from(vars.entries()), inputPos, stdout, prompts, instructionCount }
+		: null;
+	return { stdout, stderr, prompts, vars: Object.fromEntries(vars), instructionCount, stopped, timedOut, needsInput, inputPrompt, resumeState };
 }
 
 function assertInside(root: string, target: string): void {
 	const rel = relative(root, target);
 	if (rel.startsWith("..") || isAbsolute(rel)) throw new Error(`Refusing to read outside cwd: ${target}`);
+}
+
+function isSkillBasicPath(path: string): boolean {
+	return [".bas", ".skillbas", ".sbas"].includes(extname(path).toLowerCase());
+}
+
+function commandNameFromFile(path: string): string | null {
+	const ext = extname(path);
+	const name = basename(path, ext);
+	return /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(name) ? name : null;
+}
+
+function extractDescription(source: string, fallback: string): string {
+	for (const rawLine of source.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		const body = line.replace(/^\d+\s*/, "").trim();
+		if (!startsKeyword(body, "REM")) continue;
+		const description = body.slice(3).trim();
+		if (description) return description;
+	}
+	return fallback;
+}
+
+async function discoverSkillbasFiles(cwd: string): Promise<Array<{ name: string; path: string; description: string }>> {
+	const dir = resolve(cwd, ".pi", "skillbas");
+	let entries: Dirent[];
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+
+	const byName = new Map<string, { name: string; path: string; description: string; preferred: boolean }>();
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const full = join(dir, entry.name);
+		const extension = extname(entry.name).toLowerCase();
+		if (extension !== ".skillbas" && extension !== ".sbas") continue;
+		const name = commandNameFromFile(entry.name);
+		if (!name) {
+			console.warn(`Skipping Skill BASIC command with invalid name: ${entry.name}`);
+			continue;
+		}
+		const source = await readFile(full, "utf8");
+		const item = {
+			name,
+			path: full,
+			description: extractDescription(source, `Run ${entry.name} as a Skill BASIC prompt skill`),
+			preferred: extension === ".sbas",
+		};
+		const existing = byName.get(name);
+		if (!existing || (!existing.preferred && item.preferred)) byName.set(name, item);
+	}
+
+	return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 const skillbasTool = {
@@ -345,11 +433,13 @@ const skillbasTool = {
 	promptGuidelines: [
 		"Use skillbas to run small Skill BASIC snippets or .bas files when the user wants PROMPT arguments in pi context without calling the Rust interpreter.",
 		"For Skill BASIC INPUT statements, pass newline-separated input with skillbas.stdin.",
+		"When the result says 'NEEDS INPUT', ask the user for input and call skillbas again with the same code/path, the resumeState from the result, and the new stdin. Repeat until the program finishes.",
 	],
 	parameters: Type.Object({
 		code: Type.Optional(Type.String({ description: "Inline Skill BASIC source code" })),
 		path: Type.Optional(Type.String({ description: "Path to a .bas file, relative to the current project" })),
 		stdin: Type.Optional(Type.String({ description: "Optional newline-separated stdin for INPUT" })),
+		resumeState: Type.Optional(Type.Any({ description: "Resume state from a previous run that returned needsInput. Pass this along with new stdin to continue an interactive program." })),
 		timeoutMs: Type.Optional(Type.Number({ description: "Execution timeout in milliseconds; default 120000" })),
 		maxInstructions: Type.Optional(Type.Number({ description: "Maximum executed statements; default 100000" })),
 	}),
@@ -362,7 +452,7 @@ const skillbasTool = {
 		if (params.path) {
 			const full = isAbsolute(params.path) ? resolve(params.path) : resolve(ctx.cwd, params.path);
 			assertInside(ctx.cwd, full);
-			if (extname(full).toLowerCase() !== ".bas") throw new Error(`Expected a .bas file: ${params.path}`);
+			if (!isSkillBasicPath(full)) throw new Error(`Expected a .bas, .sbas, or .skillbas file: ${params.path}`);
 			const info = await stat(full);
 			if (!info.isFile()) throw new Error(`Not a file: ${params.path}`);
 			source = await readFile(full, "utf8");
@@ -375,7 +465,23 @@ const skillbasTool = {
 			params.stdin ?? "",
 			Math.max(1000, Math.min(params.timeoutMs ?? 120_000, 600_000)),
 			Math.max(1, Math.min(params.maxInstructions ?? 100_000, 1_000_000)),
+			Number.POSITIVE_INFINITY,
+			params.resumeState ?? null,
 		);
+
+		if (result.needsInput && result.resumeState) {
+			const resumeJson = JSON.stringify(result.resumeState);
+			const text = [
+				`Skill BASIC TS run: ${label}`,
+				`instructions: ${result.instructionCount}`,
+				`⚠️ NEEDS INPUT — program paused at INPUT statement`,
+				result.inputPrompt ? `input prompt: ${result.inputPrompt}` : "input prompt: (none)",
+				result.stdout ? `stdout so far:\n${result.stdout}` : "stdout: <empty>",
+				`\nTo continue: call skillbas again with the same ${params.code ? "code" : "path"}, pass the resumeState JSON below as the resumeState parameter, and provide the user's input as stdin.`,
+				`resumeState: ${resumeJson}`,
+			].join("\n");
+			return { content: [{ type: "text", text }], details: result };
+		}
 
 		const text = [
 			`Skill BASIC TS run: ${label}`,
@@ -389,8 +495,40 @@ const skillbasTool = {
 	},
 };
 
-export default function skillBasicTsExtension(pi: ExtensionAPI) {
+export default async function skillBasicTsExtension(pi: ExtensionAPI) {
 	pi.registerTool(skillbasTool);
+
+	for (const skill of await discoverSkillbasFiles(process.cwd())) {
+		pi.registerCommand(`skillbas:${skill.name}`, {
+			description: skill.description,
+			handler: async (args, ctx) => {
+				const source = await readFile(skill.path, "utf8");
+				const result = runSkillBasic(source, args ? `${args}\n` : "", 30_000, 10_000, 1);
+				if (result.stderr) {
+					ctx.ui.notify(result.stderr.trim(), "error");
+					return;
+				}
+
+				const promptText = result.prompts.join("\n\n").trim();
+				if (!promptText) {
+					ctx.ui.notify(`No PROMPT output produced by /skillbas:${skill.name}`, "warning");
+					return;
+				}
+
+				const location = relative(ctx.cwd, skill.path);
+				const skillBlock = [
+					`<skill name="skillbas:${skill.name}" location="${location}">`,
+					`References are relative to ${relative(ctx.cwd, dirname(skill.path)) || "."}.`,
+					"",
+					promptText,
+					"</skill>",
+				].join("\n");
+
+				if (ctx.isIdle()) pi.sendUserMessage(skillBlock);
+				else pi.sendUserMessage(skillBlock, { deliverAs: "followUp" });
+			},
+		});
+	}
 
 	// Make the tool active after reload/startup even if the current session's
 	// active-tool list was created before this extension existed.
