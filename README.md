@@ -147,7 +147,8 @@ default; set `pi.timeoutSeconds` for slower models or first-run initialization.
 If a pi RPC process fails or times out, the next `PROMPT` starts a fresh pi RPC
 process. Generated text is printed and flushed as streamed chunks arrive. When
 pi reports a thinking phase before answer text, Skill BASIC prints
-`[pi thinking...]` once and does not expose the hidden thinking text.
+`[pi thinking... 0s]` and updates the elapsed seconds while leaving the hidden
+thinking text private.
 
 ### Future providers
 

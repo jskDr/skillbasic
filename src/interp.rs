@@ -388,28 +388,26 @@ impl Interp {
                             self.pi_session_reset_pending = false;
                         }
                         let mut thinking_line_active = false;
-                        let reply = client.prompt_stream_events(&q, |event| {
-                            match event {
-                                crate::pi_rpc::PiRpcEvent::Text(text) => {
-                                    if thinking_line_active {
-                                        stream_text(io.out, "\n")?;
-                                        thinking_line_active = false;
-                                    }
-                                    stream_text(io.out, text)
+                        let reply = client.prompt_stream_events(&q, |event| match event {
+                            crate::pi_rpc::PiRpcEvent::Text(text) => {
+                                if thinking_line_active {
+                                    stream_text(io.out, "\n")?;
+                                    thinking_line_active = false;
                                 }
-                                crate::pi_rpc::PiRpcEvent::ThinkingStart => {
-                                    thinking_line_active = true;
-                                    stream_text(io.out, "[pi thinking... 0s]")
+                                stream_text(io.out, text)
+                            }
+                            crate::pi_rpc::PiRpcEvent::ThinkingStart => {
+                                thinking_line_active = true;
+                                stream_text(io.out, "[pi thinking... 0s]")
+                            }
+                            crate::pi_rpc::PiRpcEvent::ThinkingElapsed(elapsed) => {
+                                if thinking_line_active {
+                                    stream_text(
+                                        io.out,
+                                        &format!("\r[pi thinking... {}s]", elapsed.as_secs()),
+                                    )?;
                                 }
-                                crate::pi_rpc::PiRpcEvent::ThinkingElapsed(elapsed) => {
-                                    if thinking_line_active {
-                                        stream_text(
-                                            io.out,
-                                            &format!("\r[pi thinking... {}s]", elapsed.as_secs()),
-                                        )?;
-                                    }
-                                    Ok(())
-                                }
+                                Ok(())
                             }
                         })?;
                         self.newline(io);

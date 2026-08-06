@@ -6,4 +6,5 @@
 60 PROMPT "Evaluate user's answer: " + an$
 70 INPUT "Continue? (1=yes, 2=No) "; ct
 80 IF ct = 1 THEN 40
-90 END
+90 PRINT "Bye"
+100 END

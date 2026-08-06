@@ -133,8 +133,7 @@ impl PiRpcClient {
                 RpcNext::Value(value) => value,
                 RpcNext::Tick => {
                     if let Some(started_at) = thinking_started_at
-                        && let Err(e) =
-                            on_event(PiRpcEvent::ThinkingElapsed(started_at.elapsed()))
+                        && let Err(e) = on_event(PiRpcEvent::ThinkingElapsed(started_at.elapsed()))
                     {
                         return self.fail(&e);
                     }
@@ -271,11 +270,7 @@ impl PiRpcClient {
         }
     }
 
-    fn next_value_or_tick(
-        &mut self,
-        deadline: Instant,
-        tick: Duration,
-    ) -> Result<RpcNext, String> {
+    fn next_value_or_tick(&mut self, deadline: Instant, tick: Duration) -> Result<RpcNext, String> {
         loop {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return self.fail("?AI ERROR: pi RPC timed out");
