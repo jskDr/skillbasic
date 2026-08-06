@@ -99,7 +99,7 @@ impl Kw {
             "LOAD" => Kw::Load,
             "SAVE" => Kw::Save,
             "CLEAR" => Kw::Clear,
-            "PROMPT" => Kw::Prompt,
+            "PROMPT" | "!" => Kw::Prompt,
             "HELP" => Kw::Help,
             "AND" => Kw::And,
             "OR" => Kw::Or,

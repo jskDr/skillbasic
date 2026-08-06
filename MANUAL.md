@@ -10,7 +10,7 @@ cargo test --locked             # run tests
 ```
 
 Numbered lines are stored; unnumbered lines run immediately. A line number alone
-deletes that line. `?` is an alias for `PRINT`.
+deletes that line. `?` is an alias for `PRINT`, and `!` is an alias for `PROMPT`.
 
 When stdin and stdout are terminals, REPL commands and BASIC `INPUT` use a
 Unicode-aware line editor. Left/right arrows, Home/End, Backspace/Delete, and
@@ -44,7 +44,7 @@ CHR$ STR$ VAL ASC`.
 30 GOTO 10
 ```
 
-`PROMPT` prints the AI response and retains bounded recent conversation history.
+`PROMPT` (or `!`) prints the AI response and retains bounded recent conversation history.
 History resets at each `RUN`.
 
 ## AI configuration

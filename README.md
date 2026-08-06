@@ -80,7 +80,7 @@ examples.
 
 ## AI backends
 
-`PROMPT <expression>` evaluates its argument as a string, sends it to the
+`PROMPT <expression>` (or its `! <expression>` shorthand) evaluates its argument as a string, sends it to the
 configured AI backend, and prints the response. This makes a model interaction
 usable anywhere a BASIC statement can appear. The chatbot at the beginning of
 this README combines it with `INPUT` and `GOTO` to create a continuous

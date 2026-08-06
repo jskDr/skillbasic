@@ -43,7 +43,7 @@ fn main() {
         exit(0);
     }
 
-    let mut engine = Engine::Ollama;
+    let mut engine = Engine::PiRpc;
     let mut file_arg: Option<&str> = None;
     {
         let mut i = 1;
@@ -138,7 +138,7 @@ fn main() {
         boot_screen(&mut stdout);
     }
     loop {
-        let line = match input.read_line("> ", &mut stdout) {
+        let line = match input.read_line("]", &mut stdout) {
             Ok(ReadOutcome::Line(line)) => line,
             Ok(ReadOutcome::Eof) => {
                 writeln!(stdout).ok();
@@ -186,8 +186,8 @@ fn main() {
 /// colors (no forced green-on-black CRT aesthetic) so it fits the user's theme.
 fn boot_screen<W: Write>(out: &mut W) {
     let _ = write!(out, "\x1b[2J\x1b[H");
-    let _ = writeln!(out, "Skill BASIC v0.1.0");
-    let _ = writeln!(out, "Type HELP for commands, or start typing a program.");
+    let _ = writeln!(out, "Skill BASIC ][ v0.1.0");
+    // let _ = writeln!(out, "Type HELP for commands, or start typing a program.");
     let _ = writeln!(out);
     let _ = out.flush();
 }

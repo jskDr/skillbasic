@@ -111,6 +111,14 @@ impl<'a> Lexer<'a> {
                         pos,
                     });
                 }
+                b'!' => {
+                    // ! is alias for PROMPT
+                    self.advance();
+                    out.push(SpanTok {
+                        tok: Tok::Keyword(Kw::Prompt),
+                        pos,
+                    });
+                }
                 b'+' => {
                     self.advance();
                     out.push(SpanTok {
@@ -317,5 +325,19 @@ impl<'a> Lexer<'a> {
     }
     fn eof(&self) -> bool {
         self.pos >= self.src.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bang_is_prompt_alias() {
+        let toks = tokenize("! \"hello\"").unwrap();
+
+        assert_eq!(toks[0].tok, Tok::Keyword(Kw::Prompt));
+        assert_eq!(toks[1].tok, Tok::String("hello".into()));
+        assert_eq!(toks[2].tok, Tok::Eof);
     }
 }
