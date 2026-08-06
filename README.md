@@ -40,25 +40,25 @@ complex workflows from prompts alone. It explores a model in which natural
 language handles open-ended reasoning while a small programming language
 handles orchestration and logic.
 
-The interpreter is written in Rust. Version 0.1 uses
-[Ollama](https://ollama.com) as its first AI backend, but Skill BASIC is not
-intended to be tied to one model, provider, or API. Future versions may connect
-`PROMPT` to additional local and hosted AI services. The project is under active
-development, and language behavior or command syntax may change before version
-1.0.
+The interpreter is written in Rust. Version 0.1 supports pi RPC as the default
+AI backend and [Ollama](https://ollama.com) as a local-model backend. Skill
+BASIC is not intended to be tied to one model, provider, or API. Future versions
+may connect `PROMPT` to additional local and hosted AI services. The project is
+under active development, and language behavior or command syntax may change
+before version 1.0.
 
 ## Features
 
 - A first-class `PROMPT` statement with bounded conversational context
 - A compact logical layer for structuring multi-step AI behavior
 - Interactive and file-based execution
-- Ollama integration as the initial v0.1 AI backend
+- pi RPC by default, with Ollama available via `--engine ollama`
 - A provider-independent direction for future `PROMPT` backends
 
 ## Requirements
 
 - Rust 1.90 or later
-- Ollama, or the `pi` CLI when using the `pi-rpc` backend
+- The `pi` CLI for the default backend, or Ollama when using `--engine ollama`
 
 ## Quick start
 
@@ -86,6 +86,8 @@ usable anywhere a BASIC statement can appear. The chatbot at the beginning of
 this README combines it with `INPUT` and `GOTO` to create a continuous
 conversation in three executable lines.
 
+Responses are printed and flushed as streamed chunks arrive.
+
 Recent user and assistant messages are retained for follow-up prompts. History
 is reset at the start of each `RUN` and is bounded to limit memory use.
 
@@ -95,10 +97,15 @@ input is read lossily so a malformed UTF-8 byte does not terminate a program.
 
 ### Ollama
 
-Ollama is the reference backend in version 0.1. It makes the initial
-implementation easy to run with local models and also supports remote or cloud
-model configurations. This is an implementation starting point, not a
-restriction on the language's future direction.
+Select Ollama with `--engine ollama`:
+
+```console
+cargo run -- --engine ollama samples/aichatbot.bas
+```
+
+Ollama makes it easy to run with local models and also supports remote or cloud
+model configurations. This is an implementation option, not a restriction on
+the language's future direction.
 
 Local Ollama models can process prompts without sending them to a model
 provider. Cloud models and remote Ollama hosts send prompt and recent
@@ -107,7 +114,8 @@ or other secrets in prompts.
 
 ### pi RPC
 
-Run Skill BASIC with `--engine pi-rpc` to use an installed `pi` CLI:
+By default, Skill BASIC uses an installed `pi` CLI through pi RPC. You can also
+select it explicitly with `--engine pi-rpc`:
 
 ```console
 cargo run -- --engine pi-rpc samples/aichatbot.bas
@@ -125,16 +133,21 @@ Optional pi settings can be added alongside the existing Ollama settings in
   "pi": {
     "model": "provider/model",
     "system": "You are a concise assistant.",
-    "tools": false
+    "tools": false,
+    "timeoutSeconds": 300
   }
 }
 ```
 
 If `pi.model` or `pi.system` is omitted, pi uses its own configured default.
 Setting `pi.tools` to `true` enables pi's normal tools and extensions with the
-invoking user's permissions. RPC operations time out after 120 seconds. `RUN`,
-`NEW`, and `CLEAR` reset the pi conversation before the next `PROMPT`. pi text
-is printed and flushed one Unicode character at a time as it is generated.
+invoking user's permissions. RPC operations time out after 120 seconds by
+default; set `pi.timeoutSeconds` for slower models or first-run initialization.
+`RUN`, `NEW`, and `CLEAR` reset the pi conversation before the next `PROMPT`.
+If a pi RPC process fails or times out, the next `PROMPT` starts a fresh pi RPC
+process. Generated text is printed and flushed as streamed chunks arrive. When
+pi reports a thinking phase before answer text, Skill BASIC prints
+`[pi thinking...]` once and does not expose the hidden thinking text.
 
 ### Future providers
 

@@ -5,7 +5,7 @@
 ```console
 cargo run                       # interactive REPL
 cargo run -- program.bas        # run a file
-cargo run -- --engine pi-rpc program.bas
+cargo run -- --engine ollama program.bas
 cargo test --locked             # run tests
 ```
 
@@ -44,12 +44,12 @@ CHR$ STR$ VAL ASC`.
 30 GOTO 10
 ```
 
-`PROMPT` (or `!`) prints the AI response and retains bounded recent conversation history.
+`PROMPT` (or `!`) streams the AI response to output and retains bounded recent conversation history.
 History resets at each `RUN`.
 
 ## AI configuration
 
-The default engine is Ollama. Select pi RPC with `--engine pi-rpc`.
+The default engine is pi RPC. Select Ollama with `--engine ollama`.
 
 ### Ollama
 
@@ -70,7 +70,8 @@ cargo run -- samples/ai.bas
 
 The JSON file accepts optional `host`, `model`, and `system` fields and is
 ignored by Git. Requests time out after 120 seconds. Cloud models and remote
-hosts may process prompt data off-device.
+hosts may process prompt data off-device. Ollama responses are printed and
+flushed as streamed chunks arrive.
 
 ### pi RPC
 
@@ -83,7 +84,8 @@ default.
   "pi": {
     "model": "provider/model",
     "system": "You are a concise assistant.",
-    "tools": false
+    "tools": false,
+    "timeoutSeconds": 300
   }
 }
 ```
@@ -91,9 +93,14 @@ default.
 All `pi` fields are optional. Without a model or system value, pi uses its own
 defaults. Set `tools` to `true` only when the model should be allowed to use
 pi's configured tools and extensions with your filesystem and process
-permissions. RPC calls time out after 120 seconds. Conversation history resets
-on `RUN`, `NEW`, and `CLEAR`. Generated pi text is printed and flushed one
-Unicode character at a time instead of waiting for the complete response.
+permissions. RPC calls time out after 120 seconds by default; set
+`timeoutSeconds` for slower models or first-run initialization. Conversation
+history resets on `RUN`, `NEW`, and `CLEAR`. If a pi RPC process fails or times
+out, the next `PROMPT` starts a fresh pi RPC process. Generated text is printed
+and flushed as streamed chunks arrive instead of waiting for the complete
+response. When pi reports a thinking phase before answer text, Skill BASIC
+prints `[pi thinking... 0s]` and updates the elapsed seconds while leaving the
+hidden thinking text private.
 
 ## Limits
 

@@ -18,7 +18,7 @@
 // a slow model from hanging the program forever.
 
 use std::env;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::Duration;
 
@@ -46,6 +46,7 @@ pub struct PiConfig {
     pub model: Option<String>,
     pub system: Option<String>,
     pub tools: bool,
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Resolved AI configuration: where to reach Ollama and which model to ask for.
@@ -90,6 +91,8 @@ struct PiConfigFile {
     model: Option<String>,
     system: Option<String>,
     tools: Option<bool>,
+    #[serde(rename = "timeoutSeconds")]
+    timeout_seconds: Option<u64>,
 }
 
 impl AiConfig {
@@ -140,6 +143,7 @@ impl AiConfig {
             cfg.pi.model = pi.model;
             cfg.pi.system = pi.system;
             cfg.pi.tools = pi.tools.unwrap_or(false);
+            cfg.pi.timeout_seconds = pi.timeout_seconds;
         }
         Ok(cfg)
     }
@@ -286,6 +290,110 @@ pub fn complete(
     parsed.message.content.trim().to_string().ok_if_nonempty()
 }
 
+/// Streaming variant of `complete` for callers that want to print model output
+/// as it arrives while still receiving the complete reply for chat history.
+pub fn complete_stream<F>(
+    cfg: &AiConfig,
+    system: Option<&str>,
+    history: &[ChatMessage],
+    user_prompt: &str,
+    mut on_delta: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    let url = reqwest::Url::parse(&format!("{}/api/chat", cfg.host.trim_end_matches('/')))
+        .map_err(|e| format!("?AI ERROR: invalid Ollama host: {}", e))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(
+            "?AI ERROR: Ollama host must be an HTTP(S) URL without embedded credentials".into(),
+        );
+    }
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(sys) = system {
+        messages.push(serde_json::json!({ "role": "system", "content": sys }));
+    }
+    messages.extend(history.iter().map(|m| serde_json::to_value(m).unwrap()));
+    messages.push(serde_json::json!({ "role": "user", "content": user_prompt }));
+
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "stream": true,
+        "messages": messages
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("?AI ERROR: could not build HTTP client: {}", e))?;
+
+    let mut resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("?AI ERROR: request failed (is Ollama running?): {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let mut bytes = Vec::new();
+        resp.by_ref()
+            .take(MAX_RESPONSE_BYTES.min(4096))
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("?AI ERROR: could not read response body: {}", e))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let snippet: String = text.chars().take(160).collect();
+        return Err(format!("?AI ERROR: HTTP {}: {}", status, snippet));
+    }
+
+    let mut reader = BufReader::new(resp);
+    let mut line = String::new();
+    let mut total_bytes: u64 = 0;
+    let mut reply = String::new();
+
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("?AI ERROR: could not read response stream: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        total_bytes += read as u64;
+        if total_bytes > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "?AI ERROR: response exceeds the {} byte limit",
+                MAX_RESPONSE_BYTES
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed: ChatStreamResponse = serde_json::from_str(trimmed)
+            .map_err(|e| format!("?AI ERROR: could not parse streamed response: {}", e))?;
+        if let Some(error) = parsed.error {
+            return Err(format!("?AI ERROR: {}", error));
+        }
+        if let Some(message) = parsed.message
+            && !message.content.is_empty()
+        {
+            on_delta(&message.content)?;
+            reply.push_str(&message.content);
+        }
+        if parsed.done.unwrap_or(false) {
+            break;
+        }
+    }
+
+    reply.trim().to_string().ok_if_nonempty()
+}
+
 // ---- minimal serde model for Ollama's /api/chat response ----
 //
 // We only deserialize the fields we read; `serde_json` ignores the rest.
@@ -300,6 +408,13 @@ struct ChatResponse {
 #[derive(serde::Deserialize)]
 struct Message {
     content: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatStreamResponse {
+    message: Option<Message>,
+    done: Option<bool>,
+    error: Option<String>,
 }
 
 // Small helper: turn an empty reply into an error so callers never get a
@@ -404,7 +519,8 @@ mod tests {
                 "pi": {
                     "model": "provider/model",
                     "system": "Be concise",
-                    "tools": true
+                    "tools": true,
+                    "timeoutSeconds": 300
                 }
             }"#,
         )
@@ -413,6 +529,7 @@ mod tests {
         assert_eq!(cfg.pi.model.as_deref(), Some("provider/model"));
         assert_eq!(cfg.pi.system.as_deref(), Some("Be concise"));
         assert!(cfg.pi.tools);
+        assert_eq!(cfg.pi.timeout_seconds, Some(300));
         let _ = std::fs::remove_file(&tmp);
     }
 

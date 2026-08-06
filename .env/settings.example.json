@@ -1,4 +1,7 @@
 {
   "host": "http://localhost:11434",
-  "model": "llama3.2"
+  "model": "llama3.2",
+  "pi": {
+    "timeoutSeconds": 300
+  }
 }

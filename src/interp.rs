@@ -101,6 +101,19 @@ impl Interp {
         self.pi_rpc = Some(client);
     }
 
+    fn ensure_pi_rpc(&mut self) -> Result<(), String> {
+        let needs_restart = self
+            .pi_rpc
+            .as_ref()
+            .map(|client| client.is_stopped())
+            .unwrap_or(true);
+        if needs_restart {
+            self.pi_rpc = Some(crate::pi_rpc::PiRpcClient::spawn(&self.ai_cfg.pi)?);
+            self.pi_session_reset_pending = false;
+        }
+        Ok(())
+    }
+
     /// Load a program (line -> statements) into the flattened code vector
     /// and build the index tables.
     pub fn load(&mut self, prog: &[(u32, Vec<Stmt>)]) {
@@ -365,6 +378,7 @@ impl Interp {
                 }
                 let reply = match self.ai_cfg.engine {
                     crate::ai::Engine::PiRpc => {
+                        self.ensure_pi_rpc()?;
                         let client = self
                             .pi_rpc
                             .as_mut()
@@ -373,25 +387,50 @@ impl Interp {
                             client.new_session()?;
                             self.pi_session_reset_pending = false;
                         }
-                        let reply = client.prompt_stream(&q, |text| stream_text(io.out, text))?;
+                        let mut thinking_line_active = false;
+                        let reply = client.prompt_stream_events(&q, |event| {
+                            match event {
+                                crate::pi_rpc::PiRpcEvent::Text(text) => {
+                                    if thinking_line_active {
+                                        stream_text(io.out, "\n")?;
+                                        thinking_line_active = false;
+                                    }
+                                    stream_text(io.out, text)
+                                }
+                                crate::pi_rpc::PiRpcEvent::ThinkingStart => {
+                                    thinking_line_active = true;
+                                    stream_text(io.out, "[pi thinking... 0s]")
+                                }
+                                crate::pi_rpc::PiRpcEvent::ThinkingElapsed(elapsed) => {
+                                    if thinking_line_active {
+                                        stream_text(
+                                            io.out,
+                                            &format!("\r[pi thinking... {}s]", elapsed.as_secs()),
+                                        )?;
+                                    }
+                                    Ok(())
+                                }
+                            }
+                        })?;
                         self.newline(io);
                         reply
                     }
-                    crate::ai::Engine::Ollama => crate::ai::complete(
-                        &self.ai_cfg,
-                        Some(&self.ai_cfg.system),
-                        &self.chat,
-                        &q,
-                    )?,
+                    crate::ai::Engine::Ollama => {
+                        let reply = crate::ai::complete_stream(
+                            &self.ai_cfg,
+                            Some(&self.ai_cfg.system),
+                            &self.chat,
+                            &q,
+                            |text| stream_text(io.out, text),
+                        )?;
+                        self.newline(io);
+                        reply
+                    }
                 };
                 self.chat.push(crate::ai::ChatMessage::user(q));
                 self.chat
                     .push(crate::ai::ChatMessage::assistant(reply.clone()));
                 self.trim_chat();
-                if self.ai_cfg.engine == crate::ai::Engine::Ollama {
-                    self.emit(io, &reply);
-                    self.newline(io);
-                }
                 Ok(Ctrl::Next)
             }
             // HELP: print a concise command listing. Works in both program
@@ -850,13 +889,9 @@ impl Interp {
 }
 
 fn stream_text(out: &mut dyn Write, text: &str) -> Result<(), String> {
-    let mut bytes = [0; 4];
-    for ch in text.chars() {
-        out.write_all(ch.encode_utf8(&mut bytes).as_bytes())
-            .and_then(|_| out.flush())
-            .map_err(|e| format!("?I/O ERROR: {}", e))?;
-    }
-    Ok(())
+    out.write_all(text.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| format!("?I/O ERROR: {}", e))
 }
 
 #[cfg(test)]

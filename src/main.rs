@@ -97,6 +97,13 @@ fn main() {
             }
         }
     }
+    let ai_engine = match cfg.engine {
+        Engine::PiRpc => match cfg.pi.model.as_deref() {
+            Some(model) => format!("pi-rpc ({})", model),
+            None => "pi-rpc (pi default model)".to_string(),
+        },
+        Engine::Ollama => format!("ollama ({})", cfg.model),
+    };
     interp.set_ai_config(cfg);
 
     let stdin = io::stdin();
@@ -130,12 +137,14 @@ fn main() {
                 exit(1);
             }
         }
-        return;
+        exit(0);
     }
 
     // Interactive REPL.
     if use_line_editor {
         boot_screen(&mut stdout);
+        let _ = writeln!(stdout, "AI backend: {}", ai_engine);
+        let _ = writeln!(stdout);
     }
     loop {
         let line = match input.read_line("]", &mut stdout) {

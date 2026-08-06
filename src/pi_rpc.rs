@@ -12,6 +12,17 @@ enum RpcRead {
     Eof,
 }
 
+enum RpcNext {
+    Value(serde_json::Value),
+    Tick,
+}
+
+pub enum PiRpcEvent<'a> {
+    Text(&'a str),
+    ThinkingStart,
+    ThinkingElapsed(Duration),
+}
+
 pub struct PiRpcClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -26,7 +37,7 @@ impl PiRpcClient {
     pub fn spawn(config: &crate::ai::PiConfig) -> Result<Self, String> {
         let mut command = Command::new("pi");
         command.args(pi_args(config));
-        Self::spawn_command(command, RPC_TIMEOUT)
+        Self::spawn_command(command, rpc_timeout(config))
     }
 
     fn spawn_command(mut command: Command, timeout: Duration) -> Result<Self, String> {
@@ -95,13 +106,41 @@ impl PiRpcClient {
     where
         F: FnMut(&str) -> Result<(), String>,
     {
+        self.prompt_stream_events(message, |event| match event {
+            PiRpcEvent::Text(text) => on_text(text),
+            PiRpcEvent::ThinkingStart => Ok(()),
+            PiRpcEvent::ThinkingElapsed(_) => Ok(()),
+        })
+    }
+
+    pub fn prompt_stream_events<F>(
+        &mut self,
+        message: &str,
+        mut on_event: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(PiRpcEvent<'_>) -> Result<(), String>,
+    {
         let id = self.send_command("prompt", serde_json::json!({"message": message}))?;
         let deadline = Instant::now() + self.timeout;
         let mut accepted = false;
         let mut response_text = String::new();
+        let mut thinking_shown = false;
+        let mut thinking_started_at: Option<Instant> = None;
 
         loop {
-            let value = self.next_value(deadline)?;
+            let value = match self.next_value_or_tick(deadline, Duration::from_secs(1))? {
+                RpcNext::Value(value) => value,
+                RpcNext::Tick => {
+                    if let Some(started_at) = thinking_started_at
+                        && let Err(e) =
+                            on_event(PiRpcEvent::ThinkingElapsed(started_at.elapsed()))
+                    {
+                        return self.fail(&e);
+                    }
+                    continue;
+                }
+            };
             match value.get("type").and_then(|t| t.as_str()) {
                 Some("response") if value.get("id").and_then(|v| v.as_str()) == Some(&id) => {
                     self.check_response(&value, "prompt")?;
@@ -113,7 +152,25 @@ impl PiRpcClient {
                             Some("text_delta") => {
                                 if let Some(text) = event.get("delta").and_then(|d| d.as_str()) {
                                     response_text.push_str(text);
-                                    if let Err(e) = on_text(text) {
+                                    if let Err(e) = on_event(PiRpcEvent::Text(text)) {
+                                        return self.fail(&e);
+                                    }
+                                }
+                            }
+                            Some("thinking_start") => {
+                                if !thinking_shown {
+                                    thinking_shown = true;
+                                    thinking_started_at = Some(Instant::now());
+                                    if let Err(e) = on_event(PiRpcEvent::ThinkingStart) {
+                                        return self.fail(&e);
+                                    }
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                if !thinking_shown {
+                                    thinking_shown = true;
+                                    thinking_started_at = Some(Instant::now());
+                                    if let Err(e) = on_event(PiRpcEvent::ThinkingStart) {
                                         return self.fail(&e);
                                     }
                                 }
@@ -160,6 +217,10 @@ impl PiRpcClient {
         }
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
     fn send_command(&mut self, command: &str, fields: serde_json::Value) -> Result<String, String> {
         if self.stopped {
             return Err("?AI ERROR: pi RPC client is no longer running".into());
@@ -200,6 +261,39 @@ impl PiRpcClient {
                 Ok(RpcRead::Eof) => {
                     return self.fail("?AI ERROR: pi RPC process closed its output");
                 }
+                Err(RecvTimeoutError::Timeout) => {
+                    return self.fail("?AI ERROR: pi RPC timed out");
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return self.fail("?AI ERROR: pi RPC reader stopped unexpectedly");
+                }
+            }
+        }
+    }
+
+    fn next_value_or_tick(
+        &mut self,
+        deadline: Instant,
+        tick: Duration,
+    ) -> Result<RpcNext, String> {
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return self.fail("?AI ERROR: pi RPC timed out");
+            };
+            let wait = remaining.min(tick);
+            match self.stdout.recv_timeout(wait) {
+                Ok(RpcRead::Line(line)) if line.trim().is_empty() => continue,
+                Ok(RpcRead::Line(line)) => match serde_json::from_str(&line) {
+                    Ok(value) => return Ok(RpcNext::Value(value)),
+                    Err(e) => return self.fail(&format!("?AI ERROR: bad JSON from pi: {}", e)),
+                },
+                Ok(RpcRead::Error(e)) => {
+                    return self.fail(&format!("?AI ERROR: read from pi failed: {}", e));
+                }
+                Ok(RpcRead::Eof) => {
+                    return self.fail("?AI ERROR: pi RPC process closed its output");
+                }
+                Err(RecvTimeoutError::Timeout) if remaining > tick => return Ok(RpcNext::Tick),
                 Err(RecvTimeoutError::Timeout) => {
                     return self.fail("?AI ERROR: pi RPC timed out");
                 }
@@ -263,6 +357,13 @@ fn pi_args(config: &crate::ai::PiConfig) -> Vec<String> {
     args
 }
 
+fn rpc_timeout(config: &crate::ai::PiConfig) -> Duration {
+    config
+        .timeout_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(RPC_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +387,7 @@ mod tests {
             model: Some("provider/model".into()),
             system: Some("Be concise".into()),
             tools: true,
+            timeout_seconds: None,
         };
         let args = pi_args(&config);
         assert!(!args.iter().any(|arg| arg == "--no-tools"));
@@ -327,6 +429,56 @@ sleep 1"#;
             .unwrap();
         assert_eq!(deltas, ["안녕", "하세요"]);
         assert_eq!(reply, "안녕하세요");
+    }
+
+    #[test]
+    fn prompt_reports_thinking_without_exposing_thinking_text() {
+        let script = r#"read request
+printf '%s\n' '{"id":"skillbasic-1","type":"response","command":"prompt","success":true}'
+printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"thinking_start"}}'
+printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"hidden reasoning"}}'
+printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"answer"}}'
+printf '%s\n' '{"type":"agent_settled"}'
+sleep 1"#;
+        let mut client = shell_client(script, Duration::from_secs(1));
+        let mut events = Vec::new();
+        let reply = client
+            .prompt_stream_events("test", |event| {
+                match event {
+                    PiRpcEvent::Text(text) => events.push(format!("text:{text}")),
+                    PiRpcEvent::ThinkingStart => events.push("thinking".into()),
+                    PiRpcEvent::ThinkingElapsed(_) => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(events, ["thinking", "text:answer"]);
+        assert_eq!(reply, "answer");
+    }
+
+    #[test]
+    fn prompt_reports_elapsed_time_while_thinking() {
+        let script = r#"read request
+printf '%s\n' '{"id":"skillbasic-1","type":"response","command":"prompt","success":true}'
+printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"thinking_start"}}'
+sleep 2
+printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"answer"}}'
+printf '%s\n' '{"type":"agent_settled"}'
+sleep 1"#;
+        let mut client = shell_client(script, Duration::from_secs(4));
+        let mut saw_elapsed = false;
+        let reply = client
+            .prompt_stream_events("test", |event| {
+                if let PiRpcEvent::ThinkingElapsed(elapsed) = event
+                    && elapsed.as_secs() >= 1
+                {
+                    saw_elapsed = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(saw_elapsed);
+        assert_eq!(reply, "answer");
     }
 
     #[test]
